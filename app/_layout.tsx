@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { Stack, useRouter, useSegments } from 'expo-router';
+import { Redirect, Stack, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import * as SplashScreen from 'expo-splash-screen';
 import { AuthProvider, useAuthContext } from '../components/AuthProvider';
@@ -11,28 +11,11 @@ SplashScreen.preventAutoHideAsync();
 function RootLayoutNav() {
   const { isAuthenticated, initialized } = useAuthContext();
   const segments = useSegments();
-  const router = useRouter();
 
   useEffect(() => {
     if (!initialized) return;
-
-    // Hide splash screen once initialized
     SplashScreen.hideAsync();
   }, [initialized]);
-
-  useEffect(() => {
-    if (!initialized) return;
-
-    const inAuthGroup = segments[0] === '(auth)';
-
-    if (!isAuthenticated && !inAuthGroup) {
-      // Redirect to sign-in if not authenticated
-      router.replace('/(auth)/sign-in');
-    } else if (isAuthenticated && inAuthGroup) {
-      // Redirect to home if authenticated and trying to access auth screens
-      router.replace('/(tabs)');
-    }
-  }, [isAuthenticated, initialized]);
 
   if (!initialized) {
     return (
@@ -40,6 +23,18 @@ function RootLayoutNav() {
         <ActivityIndicator size="large" color="#007AFF" />
       </View>
     );
+  }
+
+  const inAuthGroup = segments[0] === '(auth)';
+
+  // Redirect to sign-in if not authenticated
+  if (!isAuthenticated && !inAuthGroup) {
+    return <Redirect href="/(auth)/sign-in" />;
+  }
+
+  // Redirect to home if authenticated and on auth screen
+  if (isAuthenticated && inAuthGroup) {
+    return <Redirect href="/(tabs)" />;
   }
 
   return (
