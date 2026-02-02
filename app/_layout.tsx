@@ -18,6 +18,10 @@ function RootLayoutNav() {
 
     // Hide splash screen once initialized
     SplashScreen.hideAsync();
+  }, [initialized]);
+
+  useEffect(() => {
+    if (!initialized) return;
 
     const inAuthGroup = segments[0] === '(auth)';
 
@@ -28,7 +32,7 @@ function RootLayoutNav() {
       // Redirect to home if authenticated and trying to access auth screens
       router.replace('/(tabs)');
     }
-  }, [isAuthenticated, initialized, segments]);
+  }, [isAuthenticated, initialized]);
 
   if (!initialized) {
     return (

@@ -28,14 +28,25 @@ export function useAuth() {
 
   useEffect(() => {
     // Get initial session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setState({
-        user: session?.user ?? null,
-        session,
-        initialized: true,
-        loading: false,
+    supabase.auth
+      .getSession()
+      .then(({ data: { session } }) => {
+        setState({
+          user: session?.user ?? null,
+          session,
+          initialized: true,
+          loading: false,
+        });
+      })
+      .catch(() => {
+        // Network error — still mark as initialized so the app can proceed
+        setState({
+          user: null,
+          session: null,
+          initialized: true,
+          loading: false,
+        });
       });
-    });
 
     // Listen for auth changes
     const {
@@ -45,6 +56,7 @@ export function useAuth() {
         ...prev,
         user: session?.user ?? null,
         session,
+        initialized: true,
         loading: false,
       }));
     });
