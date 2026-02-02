@@ -10,6 +10,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuthContext } from '../../components/AuthProvider';
+import { supabase } from '../../lib/supabase';
 
 interface SettingsItemProps {
   icon: keyof typeof Ionicons.glyphMap;
@@ -72,16 +73,14 @@ function SettingsItem({
 export default function SettingsScreen() {
   const { user, signOut } = useAuthContext();
   const [isSigningOut, setIsSigningOut] = useState(false);
+  const [isClearing, setIsClearing] = useState(false);
 
   const handleSignOut = () => {
     Alert.alert(
       'Sign Out',
       'Are you sure you want to sign out?',
       [
-        {
-          text: 'Cancel',
-          style: 'cancel',
-        },
+        { text: 'Cancel', style: 'cancel' },
         {
           text: 'Sign Out',
           style: 'destructive',
@@ -89,11 +88,57 @@ export default function SettingsScreen() {
             setIsSigningOut(true);
             const { error } = await signOut();
             setIsSigningOut(false);
-
             if (error) {
               Alert.alert('Error', 'Failed to sign out. Please try again.');
             }
-            // Navigation is handled automatically by the root layout
+          },
+        },
+      ],
+      { cancelable: true }
+    );
+  };
+
+  const handleClearLibrary = () => {
+    Alert.alert(
+      'Clear Library',
+      'This will delete all your clips and labels. This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear Everything',
+          style: 'destructive',
+          onPress: async () => {
+            if (!user) return;
+            setIsClearing(true);
+            try {
+              // Delete clip_labels first (foreign key constraint)
+              const { data: userClips } = await supabase
+                .from('clips')
+                .select('id')
+                .eq('user_id', user.id);
+
+              if (userClips && userClips.length > 0) {
+                const clipIds = userClips.map((c) => c.id);
+                await supabase
+                  .from('clip_labels')
+                  .delete()
+                  .in('clip_id', clipIds);
+              }
+
+              // Delete clips
+              await supabase.from('clips').delete().eq('user_id', user.id);
+
+              // Delete labels
+              await supabase.from('labels').delete().eq('user_id', user.id);
+
+              Alert.alert('Done', 'Your library has been cleared.');
+            } catch (err: unknown) {
+              const message =
+                err instanceof Error ? err.message : 'Failed to clear library';
+              Alert.alert('Error', message);
+            } finally {
+              setIsClearing(false);
+            }
           },
         },
       ],
@@ -111,6 +156,21 @@ export default function SettingsScreen() {
             title="Email"
             subtitle={user?.email ?? 'Not signed in'}
             showChevron={false}
+          />
+        </View>
+      </View>
+
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Library</Text>
+        <View style={styles.sectionContent}>
+          <SettingsItem
+            icon="trash-outline"
+            title="Clear Library"
+            subtitle="Delete all clips and labels"
+            onPress={handleClearLibrary}
+            showChevron={false}
+            danger
+            loading={isClearing}
           />
         </View>
       </View>

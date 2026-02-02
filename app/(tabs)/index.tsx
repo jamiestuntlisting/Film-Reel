@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -12,6 +12,9 @@ import {
   Modal,
   ActionSheetIOS,
   Platform,
+  TextInput,
+  ScrollView,
+  KeyboardAvoidingView,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
@@ -20,7 +23,7 @@ import * as VideoThumbnails from 'expo-video-thumbnails';
 import { useRouter } from 'expo-router';
 import { useAuthContext } from '../../components/AuthProvider';
 import { supabase } from '../../lib/supabase';
-import { Clip } from '../../types';
+import { ClipWithLabels, Label } from '../../types';
 
 const NUM_COLUMNS = 3;
 const SCREEN_WIDTH = Dimensions.get('window').width;
@@ -38,10 +41,19 @@ interface AlbumWithCount {
   videoCount: number;
 }
 
+interface PendingAsset {
+  uri: string;
+  assetId?: string | null;
+  fileName?: string | null;
+  duration?: number | null;
+  width?: number | null;
+  height?: number | null;
+}
+
 export default function LibraryScreen() {
   const { user } = useAuthContext();
   const router = useRouter();
-  const [clips, setClips] = useState<Clip[]>([]);
+  const [clips, setClips] = useState<ClipWithLabels[]>([]);
   const [loading, setLoading] = useState(true);
   const [importing, setImporting] = useState(false);
   const [progress, setProgress] = useState<ImportProgress | null>(null);
@@ -49,42 +61,102 @@ export default function LibraryScreen() {
   const [albums, setAlbums] = useState<AlbumWithCount[]>([]);
   const [loadingAlbums, setLoadingAlbums] = useState(false);
 
+  // Search / filter
+  const [searchText, setSearchText] = useState('');
+  const [allLabels, setAllLabels] = useState<Label[]>([]);
+  const [activeFilterId, setActiveFilterId] = useState<string | null>(null);
+
+  // Tag picker state
+  const [tagPickerVisible, setTagPickerVisible] = useState(false);
+  const [pendingAssets, setPendingAssets] = useState<PendingAsset[]>([]);
+  const [selectedLabelIds, setSelectedLabelIds] = useState<Set<string>>(new Set());
+  const [newLabelText, setNewLabelText] = useState('');
+
   const fetchClips = useCallback(async () => {
     if (!user) return;
     try {
       const { data, error } = await supabase
-        .from('clips')
+        .from('clips_with_labels')
         .select('*')
         .eq('user_id', user.id)
         .order('created_at', { ascending: false });
 
       if (error) throw error;
-      setClips(data ?? []);
+      setClips(
+        (data ?? []).map((c) => ({
+          ...c,
+          labels: c.labels ?? [],
+          label_ids: c.label_ids ?? [],
+        }))
+      );
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      console.error('Failed to fetch clips:', message);
+      // Fallback to clips table if view doesn't exist
+      try {
+        const { data, error } = await supabase
+          .from('clips')
+          .select('*')
+          .eq('user_id', user.id)
+          .order('created_at', { ascending: false });
+        if (error) throw error;
+        setClips(
+          (data ?? []).map((c) => ({ ...c, labels: [], label_ids: [] }))
+        );
+      } catch (fallbackErr: unknown) {
+        const message =
+          fallbackErr instanceof Error ? fallbackErr.message : 'Unknown error';
+        console.error('Failed to fetch clips:', message);
+      }
     } finally {
       setLoading(false);
     }
   }, [user]);
 
+  const fetchLabels = useCallback(async () => {
+    if (!user) return;
+    try {
+      const { data, error } = await supabase
+        .from('labels')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('name');
+      if (error) throw error;
+      setAllLabels(data ?? []);
+    } catch {
+      // Labels table might not have data yet
+    }
+  }, [user]);
+
   useEffect(() => {
     fetchClips();
-  }, [fetchClips]);
+    fetchLabels();
+  }, [fetchClips, fetchLabels]);
 
-  const importSingleAsset = async (asset: {
-    uri: string;
-    assetId?: string | null;
-    fileName?: string | null;
-    duration?: number | null;
-    width?: number | null;
-    height?: number | null;
-  }): Promise<'imported' | 'skipped' | 'error'> => {
+  const filteredClips = useMemo(() => {
+    let result = clips;
+    if (activeFilterId) {
+      result = result.filter((c) => c.label_ids.includes(activeFilterId));
+    }
+    if (searchText.trim()) {
+      const query = searchText.trim().toLowerCase();
+      result = result.filter(
+        (c) =>
+          c.labels.some((l) => l.toLowerCase().includes(query)) ||
+          (c.filename && c.filename.toLowerCase().includes(query))
+      );
+    }
+    return result;
+  }, [clips, activeFilterId, searchText]);
+
+  // ── Import logic ──────────────────────────────────────────────────────
+
+  const importSingleAsset = async (
+    asset: PendingAsset,
+    labelIds: string[]
+  ): Promise<'imported' | 'skipped' | 'error'> => {
     if (!user) return 'error';
 
     const deviceAssetId = asset.assetId ?? asset.uri;
 
-    // Check for duplicate
     const { data: existing } = await supabase
       .from('clips')
       .select('id')
@@ -100,10 +172,8 @@ export default function LibraryScreen() {
       const thumbnail = await VideoThumbnails.getThumbnailAsync(asset.uri, {
         time: 0,
       });
-
       if (thumbnail.uri) {
         const fileName = `${user.id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`;
-
         const response = await fetch(thumbnail.uri);
         const blob = await response.blob();
         const arrayBuffer = await new Response(blob).arrayBuffer();
@@ -126,17 +196,33 @@ export default function LibraryScreen() {
       // Continue without thumbnail
     }
 
-    const { error: insertError } = await supabase.from('clips').insert({
-      user_id: user.id,
-      device_asset_id: deviceAssetId,
-      thumbnail_url: thumbnailUrl,
-      filename: asset.fileName ?? null,
-      duration: asset.duration ? Math.round(asset.duration / 1000) : null,
-      width: asset.width ?? null,
-      height: asset.height ?? null,
-    });
+    const { data: insertData, error: insertError } = await supabase
+      .from('clips')
+      .insert({
+        user_id: user.id,
+        device_asset_id: deviceAssetId,
+        thumbnail_url: thumbnailUrl,
+        filename: asset.fileName ?? null,
+        duration: asset.duration ? Math.round(asset.duration / 1000) : null,
+        width: asset.width ?? null,
+        height: asset.height ?? null,
+      })
+      .select('id')
+      .single();
 
-    return insertError ? 'error' : 'imported';
+    if (insertError || !insertData) return 'error';
+
+    // Attach labels
+    if (labelIds.length > 0) {
+      await supabase.from('clip_labels').insert(
+        labelIds.map((labelId) => ({
+          clip_id: insertData.id,
+          label_id: labelId,
+        }))
+      );
+    }
+
+    return 'imported';
   };
 
   const requestPermissions = async (): Promise<boolean> => {
@@ -161,41 +247,27 @@ export default function LibraryScreen() {
         quality: 1,
       });
 
-      if (result.canceled || !result.assets || result.assets.length === 0) return;
+      if (result.canceled || !result.assets || result.assets.length === 0)
+        return;
 
-      setImporting(true);
-      const total = result.assets.length;
-      let skipped = 0;
+      const assets: PendingAsset[] = result.assets.map((v) => ({
+        uri: v.uri,
+        assetId: v.assetId,
+        fileName: v.fileName,
+        duration: v.duration,
+        width: v.width,
+        height: v.height,
+      }));
 
-      for (let i = 0; i < result.assets.length; i++) {
-        setProgress({ current: i + 1, total, skipped });
-        const video = result.assets[i];
-        const status = await importSingleAsset({
-          uri: video.uri,
-          assetId: video.assetId,
-          fileName: video.fileName,
-          duration: video.duration,
-          width: video.width,
-          height: video.height,
-        });
-        if (status === 'skipped') skipped++;
-      }
-
-      await fetchClips();
-
-      if (skipped > 0) {
-        const imported = total - skipped;
-        Alert.alert(
-          'Import Complete',
-          `${imported} clip${imported !== 1 ? 's' : ''} imported, ${skipped} duplicate${skipped !== 1 ? 's' : ''} skipped.`
-        );
-      }
+      setPendingAssets(assets);
+      setSelectedLabelIds(new Set());
+      setNewLabelText('');
+      await fetchLabels();
+      setTagPickerVisible(true);
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Failed to import clips';
+      const message =
+        err instanceof Error ? err.message : 'Failed to select videos';
       Alert.alert('Error', message);
-    } finally {
-      setImporting(false);
-      setProgress(null);
     }
   };
 
@@ -217,7 +289,6 @@ export default function LibraryScreen() {
         includeSmartAlbums: true,
       });
 
-      // Get video counts for each album
       const albumsWithCounts: AlbumWithCount[] = [];
       for (const album of allAlbums) {
         const { totalCount } = await MediaLibrary.getAssetsAsync({
@@ -233,7 +304,8 @@ export default function LibraryScreen() {
       albumsWithCounts.sort((a, b) => b.videoCount - a.videoCount);
       setAlbums(albumsWithCounts);
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Failed to load albums';
+      const message =
+        err instanceof Error ? err.message : 'Failed to load albums';
       Alert.alert('Error', message);
       setAlbumModalVisible(false);
     } finally {
@@ -241,12 +313,10 @@ export default function LibraryScreen() {
     }
   };
 
-  const importAlbum = async (album: MediaLibrary.Album) => {
+  const selectAlbum = async (album: MediaLibrary.Album) => {
     setAlbumModalVisible(false);
 
     try {
-      setImporting(true);
-
       let allAssets: MediaLibrary.Asset[] = [];
       let hasMore = true;
       let endCursor: string | undefined;
@@ -269,16 +339,10 @@ export default function LibraryScreen() {
         return;
       }
 
-      const total = allAssets.length;
-      let skipped = 0;
-      let errors = 0;
-
-      for (let i = 0; i < allAssets.length; i++) {
-        setProgress({ current: i + 1, total, skipped });
-        const asset = allAssets[i];
+      const assets: PendingAsset[] = [];
+      for (const asset of allAssets) {
         const assetInfo = await MediaLibrary.getAssetInfoAsync(asset);
-
-        const status = await importSingleAsset({
+        assets.push({
           uri: assetInfo.localUri ?? asset.uri,
           assetId: asset.id,
           fileName: asset.filename,
@@ -286,27 +350,111 @@ export default function LibraryScreen() {
           width: asset.width,
           height: asset.height,
         });
+      }
 
+      setPendingAssets(assets);
+      setSelectedLabelIds(new Set());
+      setNewLabelText('');
+      await fetchLabels();
+      setTagPickerVisible(true);
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to load album';
+      Alert.alert('Error', message);
+    }
+  };
+
+  const createAndSelectLabel = async () => {
+    const name = newLabelText.trim();
+    if (!name || !user) return;
+
+    // Check if label already exists
+    const existing = allLabels.find(
+      (l) => l.name.toLowerCase() === name.toLowerCase()
+    );
+    if (existing) {
+      setSelectedLabelIds((prev) => new Set([...prev, existing.id]));
+      setNewLabelText('');
+      return;
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from('labels')
+        .insert({ user_id: user.id, name })
+        .select()
+        .single();
+
+      if (error) throw error;
+      if (data) {
+        setAllLabels((prev) => [...prev, data].sort((a, b) => a.name.localeCompare(b.name)));
+        setSelectedLabelIds((prev) => new Set([...prev, data.id]));
+      }
+      setNewLabelText('');
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to create label';
+      Alert.alert('Error', message);
+    }
+  };
+
+  const confirmImport = async () => {
+    setTagPickerVisible(false);
+    const labelIds = Array.from(selectedLabelIds);
+    const assets = pendingAssets;
+    setPendingAssets([]);
+
+    try {
+      setImporting(true);
+      const total = assets.length;
+      let skipped = 0;
+      let errors = 0;
+
+      for (let i = 0; i < assets.length; i++) {
+        setProgress({ current: i + 1, total, skipped });
+        const status = await importSingleAsset(assets[i], labelIds);
         if (status === 'skipped') skipped++;
         if (status === 'error') errors++;
       }
 
       await fetchClips();
+      await fetchLabels();
 
       const imported = total - skipped - errors;
       const parts: string[] = [];
-      if (imported > 0) parts.push(`${imported} clip${imported !== 1 ? 's' : ''} imported`);
-      if (skipped > 0) parts.push(`${skipped} duplicate${skipped !== 1 ? 's' : ''} skipped`);
+      if (imported > 0)
+        parts.push(
+          `${imported} clip${imported !== 1 ? 's' : ''} imported`
+        );
+      if (skipped > 0)
+        parts.push(
+          `${skipped} duplicate${skipped !== 1 ? 's' : ''} skipped`
+        );
       if (errors > 0) parts.push(`${errors} error${errors !== 1 ? 's' : ''}`);
 
-      Alert.alert('Import Complete', parts.join(', ') + '.');
+      if (parts.length > 0) {
+        Alert.alert('Import Complete', parts.join(', ') + '.');
+      }
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Failed to import album';
+      const message =
+        err instanceof Error ? err.message : 'Failed to import clips';
       Alert.alert('Error', message);
     } finally {
       setImporting(false);
       setProgress(null);
     }
+  };
+
+  const toggleLabelSelection = (labelId: string) => {
+    setSelectedLabelIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(labelId)) {
+        next.delete(labelId);
+      } else {
+        next.add(labelId);
+      }
+      return next;
+    });
   };
 
   const showAddOptions = () => {
@@ -330,7 +478,9 @@ export default function LibraryScreen() {
     }
   };
 
-  const renderClip = ({ item }: { item: Clip }) => (
+  // ── Render helpers ────────────────────────────────────────────────────
+
+  const renderClip = ({ item }: { item: ClipWithLabels }) => (
     <TouchableOpacity
       style={styles.tile}
       onPress={() => router.push(`/clip/${item.id}`)}
@@ -345,7 +495,17 @@ export default function LibraryScreen() {
       )}
       {item.duration != null && (
         <View style={styles.durationBadge}>
-          <Text style={styles.durationText}>{formatDuration(item.duration)}</Text>
+          <Text style={styles.durationText}>
+            {formatDuration(item.duration)}
+          </Text>
+        </View>
+      )}
+      {item.labels.length > 0 && (
+        <View style={styles.tileLabelBadge}>
+          <Text style={styles.tileLabelText} numberOfLines={1}>
+            {item.labels[0]}
+            {item.labels.length > 1 ? ` +${item.labels.length - 1}` : ''}
+          </Text>
         </View>
       )}
     </TouchableOpacity>
@@ -354,7 +514,7 @@ export default function LibraryScreen() {
   const renderAlbumItem = ({ item }: { item: AlbumWithCount }) => (
     <TouchableOpacity
       style={styles.albumItem}
-      onPress={() => importAlbum(item.album)}
+      onPress={() => selectAlbum(item.album)}
       activeOpacity={0.7}
     >
       <Ionicons name="folder-outline" size={24} color="#007AFF" />
@@ -370,6 +530,84 @@ export default function LibraryScreen() {
     </TouchableOpacity>
   );
 
+  const searchAndFilterHeader = (
+    <View>
+      <View style={styles.searchContainer}>
+        <Ionicons
+          name="search"
+          size={18}
+          color="#888"
+          style={styles.searchIcon}
+        />
+        <TextInput
+          style={styles.searchInput}
+          placeholder="Search by label or filename..."
+          placeholderTextColor="#666"
+          value={searchText}
+          onChangeText={setSearchText}
+          returnKeyType="search"
+          autoCapitalize="none"
+          autoCorrect={false}
+        />
+        {searchText.length > 0 && (
+          <TouchableOpacity onPress={() => setSearchText('')}>
+            <Ionicons name="close-circle" size={18} color="#666" />
+          </TouchableOpacity>
+        )}
+      </View>
+      {allLabels.length > 0 && (
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.filterChipsContainer}
+        >
+          <TouchableOpacity
+            style={[
+              styles.filterChip,
+              !activeFilterId && styles.filterChipActive,
+            ]}
+            onPress={() => setActiveFilterId(null)}
+          >
+            <Text
+              style={[
+                styles.filterChipText,
+                !activeFilterId && styles.filterChipTextActive,
+              ]}
+            >
+              All
+            </Text>
+          </TouchableOpacity>
+          {allLabels.map((label) => (
+            <TouchableOpacity
+              key={label.id}
+              style={[
+                styles.filterChip,
+                activeFilterId === label.id && styles.filterChipActive,
+              ]}
+              onPress={() =>
+                setActiveFilterId(
+                  activeFilterId === label.id ? null : label.id
+                )
+              }
+            >
+              <Text
+                style={[
+                  styles.filterChipText,
+                  activeFilterId === label.id &&
+                    styles.filterChipTextActive,
+                ]}
+              >
+                {label.name}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+      )}
+    </View>
+  );
+
+  // ── Loading state ─────────────────────────────────────────────────────
+
   if (loading) {
     return (
       <View style={styles.centered}>
@@ -377,6 +615,8 @@ export default function LibraryScreen() {
       </View>
     );
   }
+
+  // ── Import overlay ────────────────────────────────────────────────────
 
   const importOverlay = importing && progress && (
     <View style={styles.importOverlay}>
@@ -387,20 +627,25 @@ export default function LibraryScreen() {
         </Text>
         {progress.skipped > 0 && (
           <Text style={styles.importSubtext}>
-            {progress.skipped} duplicate{progress.skipped !== 1 ? 's' : ''} skipped
+            {progress.skipped} duplicate
+            {progress.skipped !== 1 ? 's' : ''} skipped
           </Text>
         )}
         <View style={styles.progressBarTrack}>
           <View
             style={[
               styles.progressBarFill,
-              { width: `${(progress.current / progress.total) * 100}%` },
+              {
+                width: `${(progress.current / progress.total) * 100}%`,
+              },
             ]}
           />
         </View>
       </View>
     </View>
   );
+
+  // ── Empty state ───────────────────────────────────────────────────────
 
   if (clips.length === 0 && !importing) {
     return (
@@ -428,19 +673,42 @@ export default function LibraryScreen() {
           onClose={() => setAlbumModalVisible(false)}
           renderAlbumItem={renderAlbumItem}
         />
+        <TagPickerModal
+          visible={tagPickerVisible}
+          labels={allLabels}
+          selectedIds={selectedLabelIds}
+          onToggle={toggleLabelSelection}
+          newLabelText={newLabelText}
+          onNewLabelTextChange={setNewLabelText}
+          onCreateLabel={createAndSelectLabel}
+          onConfirm={confirmImport}
+          onCancel={() => {
+            setTagPickerVisible(false);
+            setPendingAssets([]);
+          }}
+          assetCount={pendingAssets.length}
+        />
       </View>
     );
   }
 
+  // ── Main content ──────────────────────────────────────────────────────
+
   return (
     <View style={styles.container}>
       <FlatList
-        data={clips}
+        data={filteredClips}
         renderItem={renderClip}
         keyExtractor={(item) => item.id}
         numColumns={NUM_COLUMNS}
         contentContainerStyle={styles.grid}
         columnWrapperStyle={styles.row}
+        ListHeaderComponent={searchAndFilterHeader}
+        ListEmptyComponent={
+          <View style={styles.noResults}>
+            <Text style={styles.noResultsText}>No clips match your search</Text>
+          </View>
+        }
       />
       <TouchableOpacity
         style={styles.fab}
@@ -462,9 +730,174 @@ export default function LibraryScreen() {
         onClose={() => setAlbumModalVisible(false)}
         renderAlbumItem={renderAlbumItem}
       />
+      <TagPickerModal
+        visible={tagPickerVisible}
+        labels={allLabels}
+        selectedIds={selectedLabelIds}
+        onToggle={toggleLabelSelection}
+        newLabelText={newLabelText}
+        onNewLabelTextChange={setNewLabelText}
+        onCreateLabel={createAndSelectLabel}
+        onConfirm={confirmImport}
+        onCancel={() => {
+          setTagPickerVisible(false);
+          setPendingAssets([]);
+        }}
+        assetCount={pendingAssets.length}
+      />
     </View>
   );
 }
+
+// ── Tag Picker Modal ──────────────────────────────────────────────────────
+
+interface TagPickerModalProps {
+  visible: boolean;
+  labels: Label[];
+  selectedIds: Set<string>;
+  onToggle: (id: string) => void;
+  newLabelText: string;
+  onNewLabelTextChange: (text: string) => void;
+  onCreateLabel: () => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+  assetCount: number;
+}
+
+function TagPickerModal({
+  visible,
+  labels,
+  selectedIds,
+  onToggle,
+  newLabelText,
+  onNewLabelTextChange,
+  onCreateLabel,
+  onConfirm,
+  onCancel,
+  assetCount,
+}: TagPickerModalProps) {
+  const hasSelection = selectedIds.size > 0;
+  const trimmed = newLabelText.trim();
+  const canCreate =
+    trimmed.length > 0 &&
+    !labels.some((l) => l.name.toLowerCase() === trimmed.toLowerCase());
+
+  return (
+    <Modal
+      visible={visible}
+      animationType="slide"
+      presentationStyle="pageSheet"
+      onRequestClose={onCancel}
+    >
+      <KeyboardAvoidingView
+        style={styles.modalContainer}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        <View style={styles.modalHeader}>
+          <TouchableOpacity onPress={onCancel}>
+            <Text style={styles.cancelText}>Cancel</Text>
+          </TouchableOpacity>
+          <Text style={styles.modalTitle}>
+            Tag {assetCount} Clip{assetCount !== 1 ? 's' : ''}
+          </Text>
+          <TouchableOpacity
+            onPress={onConfirm}
+            disabled={!hasSelection}
+          >
+            <Text
+              style={[
+                styles.confirmText,
+                !hasSelection && styles.confirmTextDisabled,
+              ]}
+            >
+              Import
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        <Text style={styles.tagPickerHint}>
+          Select at least one label for these clips
+        </Text>
+
+        <View style={styles.createLabelRow}>
+          <TextInput
+            style={styles.createLabelInput}
+            placeholder="Type to create a new label..."
+            placeholderTextColor="#666"
+            value={newLabelText}
+            onChangeText={onNewLabelTextChange}
+            onSubmitEditing={onCreateLabel}
+            returnKeyType="done"
+            autoCapitalize="none"
+          />
+          {canCreate && (
+            <TouchableOpacity
+              style={styles.createLabelButton}
+              onPress={onCreateLabel}
+            >
+              <Ionicons name="add-circle" size={20} color="#007AFF" />
+              <Text style={styles.createLabelButtonText}>
+                Create "{trimmed}"
+              </Text>
+            </TouchableOpacity>
+          )}
+          {!canCreate && trimmed.length > 0 && (
+            <TouchableOpacity
+              style={styles.createLabelButton}
+              onPress={onCreateLabel}
+            >
+              <Ionicons name="checkmark-circle" size={20} color="#34C759" />
+              <Text style={styles.createLabelButtonText}>
+                Select "{trimmed}"
+              </Text>
+            </TouchableOpacity>
+          )}
+        </View>
+
+        <ScrollView
+          style={styles.tagPickerScroll}
+          contentContainerStyle={styles.tagPickerChips}
+        >
+          {labels.map((label) => {
+            const isSelected = selectedIds.has(label.id);
+            return (
+              <TouchableOpacity
+                key={label.id}
+                style={[
+                  styles.tagChip,
+                  isSelected && styles.tagChipSelected,
+                ]}
+                onPress={() => onToggle(label.id)}
+              >
+                <Ionicons
+                  name={isSelected ? 'checkmark-circle' : 'ellipse-outline'}
+                  size={18}
+                  color={isSelected ? '#fff' : '#888'}
+                  style={{ marginRight: 6 }}
+                />
+                <Text
+                  style={[
+                    styles.tagChipText,
+                    isSelected && styles.tagChipTextSelected,
+                  ]}
+                >
+                  {label.name}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+          {labels.length === 0 && (
+            <Text style={styles.noLabelsHint}>
+              No labels yet. Type above to create your first label.
+            </Text>
+          )}
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
+// ── Album Modal ─────────────────────────────────────────────────────────
 
 interface AlbumModalProps {
   visible: boolean;
@@ -474,7 +907,13 @@ interface AlbumModalProps {
   renderAlbumItem: ({ item }: { item: AlbumWithCount }) => React.JSX.Element;
 }
 
-function AlbumModal({ visible, albums, loading, onClose, renderAlbumItem }: AlbumModalProps) {
+function AlbumModal({
+  visible,
+  albums,
+  loading,
+  onClose,
+  renderAlbumItem,
+}: AlbumModalProps) {
   return (
     <Modal
       visible={visible}
@@ -484,8 +923,12 @@ function AlbumModal({ visible, albums, loading, onClose, renderAlbumItem }: Albu
     >
       <View style={styles.modalContainer}>
         <View style={styles.modalHeader}>
+          <View style={{ width: 60 }} />
           <Text style={styles.modalTitle}>Select Album</Text>
-          <TouchableOpacity onPress={onClose} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+          <TouchableOpacity
+            onPress={onClose}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          >
             <Ionicons name="close" size={24} color="#fff" />
           </TouchableOpacity>
         </View>
@@ -497,7 +940,9 @@ function AlbumModal({ visible, albums, loading, onClose, renderAlbumItem }: Albu
         ) : albums.length === 0 ? (
           <View style={styles.centered}>
             <Ionicons name="folder-open-outline" size={48} color="#555" />
-            <Text style={styles.noAlbumsText}>No albums with videos found</Text>
+            <Text style={styles.noAlbumsText}>
+              No albums with videos found
+            </Text>
           </View>
         ) : (
           <FlatList
@@ -512,11 +957,15 @@ function AlbumModal({ visible, albums, loading, onClose, renderAlbumItem }: Albu
   );
 }
 
+// ── Helpers ─────────────────────────────────────────────────────────────
+
 function formatDuration(seconds: number): string {
   const mins = Math.floor(seconds / 60);
   const secs = seconds % 60;
   return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
+
+// ── Styles ──────────────────────────────────────────────────────────────
 
 const styles = StyleSheet.create({
   container: {
@@ -563,8 +1012,62 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     marginLeft: 8,
   },
+  // Search
+  searchContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#2a2a2a',
+    borderRadius: 10,
+    marginHorizontal: 12,
+    marginTop: 8,
+    marginBottom: 4,
+    paddingHorizontal: 12,
+    height: 40,
+  },
+  searchIcon: {
+    marginRight: 8,
+  },
+  searchInput: {
+    flex: 1,
+    color: '#fff',
+    fontSize: 15,
+  },
+  // Filter chips
+  filterChipsContainer: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8,
+  },
+  filterChip: {
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 16,
+    backgroundColor: '#2a2a2a',
+    marginRight: 0,
+  },
+  filterChipActive: {
+    backgroundColor: '#007AFF',
+  },
+  filterChipText: {
+    color: '#ccc',
+    fontSize: 13,
+    fontWeight: '500',
+  },
+  filterChipTextActive: {
+    color: '#fff',
+  },
+  noResults: {
+    padding: 40,
+    alignItems: 'center',
+  },
+  noResultsText: {
+    color: '#888',
+    fontSize: 15,
+  },
+  // Grid
   grid: {
-    padding: TILE_GAP,
+    paddingHorizontal: TILE_GAP,
+    paddingBottom: 80,
   },
   row: {
     gap: TILE_GAP,
@@ -603,6 +1106,21 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '500',
   },
+  tileLabelBadge: {
+    position: 'absolute',
+    top: 4,
+    left: 4,
+    right: 4,
+    backgroundColor: 'rgba(0, 122, 255, 0.8)',
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  tileLabelText: {
+    color: '#fff',
+    fontSize: 9,
+    fontWeight: '600',
+  },
   fab: {
     position: 'absolute',
     bottom: 24,
@@ -619,6 +1137,7 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
     elevation: 5,
   },
+  // Import overlay
   importOverlay: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: 'rgba(0, 0, 0, 0.7)',
@@ -656,6 +1175,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#007AFF',
     borderRadius: 2,
   },
+  // Modal shared
   modalContainer: {
     flex: 1,
     backgroundColor: '#1a1a1a',
@@ -673,6 +1193,19 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#fff',
   },
+  cancelText: {
+    color: '#007AFF',
+    fontSize: 16,
+  },
+  confirmText: {
+    color: '#007AFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  confirmTextDisabled: {
+    color: '#555',
+  },
+  // Album modal
   albumList: {
     padding: 8,
   },
@@ -706,5 +1239,73 @@ const styles = StyleSheet.create({
     color: '#888',
     fontSize: 14,
     marginTop: 12,
+  },
+  // Tag picker
+  tagPickerHint: {
+    color: '#888',
+    fontSize: 13,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 4,
+  },
+  createLabelRow: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  createLabelInput: {
+    backgroundColor: '#2a2a2a',
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    color: '#fff',
+    fontSize: 15,
+  },
+  createLabelButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+  },
+  createLabelButtonText: {
+    color: '#007AFF',
+    fontSize: 14,
+    marginLeft: 6,
+  },
+  tagPickerScroll: {
+    flex: 1,
+  },
+  tagPickerChips: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    padding: 16,
+    gap: 10,
+  },
+  tagChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#2a2a2a',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#444',
+  },
+  tagChipSelected: {
+    backgroundColor: '#007AFF',
+    borderColor: '#007AFF',
+  },
+  tagChipText: {
+    color: '#ccc',
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  tagChipTextSelected: {
+    color: '#fff',
+  },
+  noLabelsHint: {
+    color: '#888',
+    fontSize: 14,
+    textAlign: 'center',
+    paddingTop: 20,
   },
 });
